@@ -1,0 +1,145 @@
+name: Medical Chatbot CI/CD
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: medical-chatbot-production
+  cancel-in-progress: true
+
+env:
+  CONTAINER_NAME: medical-chatbot
+  CONTAINER_PORT: "8080"
+
+jobs:
+  build-and-push:
+    name: Test, Build, and Push
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate Python syntax
+        run: |
+          python -m compileall -q app.py store_index.py src
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Build and push Docker image
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          LATEST_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+
+          docker build \
+            --tag "$IMAGE_URI" \
+            --tag "$LATEST_URI" \
+            .
+
+          docker push "$IMAGE_URI"
+          docker push "$LATEST_URI"
+
+          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+    timeout-minutes: 20
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.3
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+
+      - name: Log in to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2.1.6
+
+      - name: Pull application image
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+        run: |
+          docker pull "$IMAGE_URI"
+
+      - name: Replace application container
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+          PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
+        run: |
+          docker rm --force "$CONTAINER_NAME" 2>/dev/null || true
+
+          docker run \
+            --detach \
+            --restart unless-stopped \
+            --name "$CONTAINER_NAME" \
+            --publish "$CONTAINER_PORT:8080" \
+            --env OPENAI_API_KEY="$OPENAI_API_KEY" \
+            --env PINECONE_API_KEY="$PINECONE_API_KEY" \
+            --env PINECONE_INDEX_NAME="$PINECONE_INDEX_NAME" \
+            --env PINECONE_NAMESPACE="$PINECONE_NAMESPACE" \
+            --env OPENAI_CHAT_MODEL="gpt-4o-mini" \
+            --env APP_HOST="0.0.0.0" \
+            --env APP_PORT="8080" \
+            --env FLASK_DEBUG="false" \
+            "$IMAGE_URI"
+
+      - name: Verify deployment
+        run: |
+          for attempt in $(seq 1 12); do
+            if curl --fail --silent \
+              "http://127.0.0.1:$CONTAINER_PORT/health" > /dev/null; then
+              echo "Medical chatbot is healthy."
+              exit 0
+            fi
+
+            echo "Waiting for application: attempt $attempt/12"
+            sleep 5
+          done
+
+          echo "Application failed its health check."
+          docker logs --tail 100 "$CONTAINER_NAME"
+          exit 1
+
+      - name: Remove unused Docker images
+        if: success()
+        run: |
+          docker image prune --force
