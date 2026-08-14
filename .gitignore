@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+.env
+.env.*
+!.env.example
+env/
+.venv/
+venv/
+rag_bot/
+rag_bot/*
+rag1/
+rag1/*
