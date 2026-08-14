@@ -18,13 +18,10 @@ env:
   CONTAINER_PORT: "8080"
 
 jobs:
-  build-and-push:
+  build:
     name: Test, Build, and Push
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    outputs:
-      image_uri: ${{ steps.image.outputs.image_uri }}
 
     steps:
       - name: Checkout repository
@@ -37,7 +34,8 @@ jobs:
 
       - name: Validate Python syntax
         run: |
-          python -m compileall -q app.py store_index.py src
+          python --version
+          python -m compileall app.py store_index.py src
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6.2.3
@@ -51,14 +49,27 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2.1.6
 
       - name: Build and push Docker image
-        id: image
         env:
           ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+          ECR_REPO: ${{ secrets.ECR_REPO }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          IMAGE_URI="$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          LATEST_URI="$ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          set -euo pipefail
+
+          if [ -z "$ECR_REGISTRY" ]; then
+            echo "ECR registry is empty."
+            exit 1
+          fi
+
+          if [ -z "$ECR_REPO" ]; then
+            echo "ECR_REPO secret is empty."
+            exit 1
+          fi
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+          LATEST_URI="$ECR_REGISTRY/$ECR_REPO:latest"
+
+          echo "Building image: $IMAGE_URI"
 
           docker build \
             --tag "$IMAGE_URI" \
@@ -68,15 +79,15 @@ jobs:
           docker push "$IMAGE_URI"
           docker push "$LATEST_URI"
 
-          echo "image_uri=$IMAGE_URI" >> "$GITHUB_OUTPUT"
-
   deploy:
     name: Deploy to EC2
-    needs: build-and-push
+    needs: build
+
     runs-on:
       - self-hosted
       - Linux
       - X64
+
     timeout-minutes: 20
     environment: production
 
@@ -89,22 +100,46 @@ jobs:
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
 
       - name: Log in to Amazon ECR
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2.1.6
 
-      - name: Pull application image
+      - name: Create image URI
         env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          ECR_REPO: ${{ secrets.ECR_REPO }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
+          set -euo pipefail
+
+          if [ -z "$ECR_REGISTRY" ]; then
+            echo "ECR registry is empty."
+            exit 1
+          fi
+
+          if [ -z "$ECR_REPO" ]; then
+            echo "ECR_REPO secret is empty."
+            exit 1
+          fi
+
+          IMAGE_URI="$ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+
+          echo "IMAGE_URI=$IMAGE_URI" >> "$GITHUB_ENV"
+          echo "Deployment image: $IMAGE_URI"
+
+      - name: Pull application image
+        run: |
+          set -euo pipefail
           docker pull "$IMAGE_URI"
 
       - name: Replace application container
         env:
-          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
           PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
           PINECONE_NAMESPACE: ${{ secrets.PINECONE_NAMESPACE }}
         run: |
+          set -euo pipefail
+
           docker rm --force "$CONTAINER_NAME" 2>/dev/null || true
 
           docker run \
@@ -124,10 +159,13 @@ jobs:
 
       - name: Verify deployment
         run: |
+          set -euo pipefail
+
           for attempt in $(seq 1 12); do
             if curl --fail --silent \
               "http://127.0.0.1:$CONTAINER_PORT/health" > /dev/null; then
-              echo "Medical chatbot is healthy."
+              echo "Medical chatbot deployment is healthy."
+              docker ps --filter "name=$CONTAINER_NAME"
               exit 0
             fi
 
@@ -136,7 +174,8 @@ jobs:
           done
 
           echo "Application failed its health check."
-          docker logs --tail 100 "$CONTAINER_NAME"
+          docker ps -a --filter "name=$CONTAINER_NAME"
+          docker logs --tail 200 "$CONTAINER_NAME" || true
           exit 1
 
       - name: Remove unused Docker images
